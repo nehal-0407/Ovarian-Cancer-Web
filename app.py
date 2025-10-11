@@ -11,13 +11,21 @@ import os
 import gdown
 import sys, types
 
-# --- Patch for missing pytorch_grad_cam on Streamlit Cloud ---
+# ----------------------------
+# Patches for missing modules (Streamlit Cloud compatibility)
+# ----------------------------
 if "pytorch_grad_cam" not in sys.modules:
     sys.modules["pytorch_grad_cam"] = types.ModuleType("pytorch_grad_cam")
     sys.modules["pytorch_grad_cam.activations_and_gradients"] = types.ModuleType("pytorch_grad_cam.activations_and_gradients")
-    sys.modules["pytorch_grad_cam.activations_and_gradients"].ActivationsAndGradients = type(
-        "ActivationsAndGradients", (), {"__init__": lambda self, *a, **k: None, "save_activation": lambda self, x: None}
-    )
+
+    class FakeActivationsAndGradients:
+        def __init__(self, *a, **kw):
+            pass
+        def save_activation(self, *a, **kw):
+            return None
+        def save_gradient(self, *a, **kw):
+            return None
+    sys.modules["pytorch_grad_cam.activations_and_gradients"].ActivationsAndGradients = FakeActivationsAndGradients
 
 # ----------------------------
 # Streamlit setup
@@ -27,15 +35,40 @@ st.title("🧬 Ovarian Cancer Detection App")
 st.write("Upload a histopathology image to predict whether it's **Ovarian Cancer or Non-Ovarian Cancer**.")
 
 # ----------------------------
-# Sidebar
+# Sidebar controls
 # ----------------------------
 st.sidebar.header("⚙️ Preprocessing & Calibration")
-input_size = st.sidebar.selectbox("Input size", [224, 256, 288, 384], index=0)
-threshold = st.sidebar.slider("Decision threshold", 0.0, 1.0, 0.5, 0.01)
-temperature = st.sidebar.slider("Temperature (confidence calibration)", 0.5, 3.0, 1.0, 0.1)
+input_size = st.sidebar.selectbox("Input size (pixels)", [224, 256, 288, 384], index=0)
+
+normalization = st.sidebar.selectbox(
+    "Normalization", ["ImageNet (default)", "0-1 (no normalize)", "Custom"], index=0
+)
+
+if normalization == "Custom":
+    mean_str = st.sidebar.text_input("Mean (comma)", "0.485,0.456,0.406")
+    std_str = st.sidebar.text_input("Std (comma)", "0.229,0.224,0.225")
+    try:
+        mean = [float(x.strip()) for x in mean_str.split(",")]
+        std = [float(x.strip()) for x in std_str.split(",")]
+    except:
+        st.sidebar.error("⚠️ Error parsing custom mean/std — using defaults.")
+        mean = [0.485, 0.456, 0.406]
+        std = [0.229, 0.224, 0.225]
+elif normalization == "ImageNet (default)":
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+else:
+    mean = [0.0, 0.0, 0.0]
+    std = [1.0, 1.0, 1.0]
+
+threshold = st.sidebar.slider("Decision threshold for Cancer", 0.0, 1.0, 0.50, 0.01)
+temperature = st.sidebar.slider("Temperature (confidence calibration)", 0.5, 3.0, 1.5, 0.1)
 bias_factor = st.sidebar.slider("Bias factor (malignant multiplier)", 0.2, 2.0, 1.0, 0.01)
 flip_labels = st.sidebar.checkbox("Reverse label interpretation", False)
 show_debug = st.sidebar.checkbox("Show raw logits/probabilities", False)
+
+st.sidebar.markdown("---")
+st.sidebar.caption("If your model over-predicts cancer, try reducing Bias factor (<1).")
 
 # ----------------------------
 # Model definition
@@ -72,24 +105,22 @@ def ensure_model_downloaded(local_path="hybrid_models_fixed.pkl"):
     return local_path
 
 # ----------------------------
-# Load model safely
+# Load model (with all compatibility patches)
 # ----------------------------
 @st.cache_resource
 def load_model():
     path = ensure_model_downloaded()
 
-    # Patch missing timm attributes
+    # Patch timm internal classes for old pickle compatibility
     import timm.models.vision_transformer as vit_mod
     if hasattr(vit_mod, "Attention"):
         Attn = vit_mod.Attention
         if not hasattr(Attn, "norm"):
-            def fake_norm(self, x): return x
-            Attn.norm = fake_norm
-            old_init = Attn.__init__
-            def new_init(self, *a, **kw):
-                old_init(self, *a, **kw)
-                self.norm = lambda x: x
-            Attn.__init__ = new_init
+            Attn.norm = lambda self, x: x
+    if hasattr(vit_mod, "VisionTransformer"):
+        VT = vit_mod.VisionTransformer
+        if not hasattr(VT, "pool_include_prefix"):
+            VT.pool_include_prefix = None
 
     try:
         with open(path, "rb") as f:
@@ -105,34 +136,28 @@ def load_model():
         st.error(f"❌ Failed to load model: {e}")
         return None
 
-# ----------------------------
-# Initialize model
-# ----------------------------
-try:
-    model = load_model()
-except Exception as e:
-    st.error(f"❌ Unexpected error while initializing model: {e}")
-    model = None
+model = load_model()
 
 # ----------------------------
 # Image preprocessing
 # ----------------------------
-def make_transform(size):
+def make_transform(size, mean, std):
     return transforms.Compose([
         transforms.Resize((size, size)),
         transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406],
-                             [0.229, 0.224, 0.225])
+        transforms.Normalize(mean=mean, std=std)
     ])
-transform = make_transform(input_size)
+
+transform = make_transform(input_size, mean, std)
 
 # ----------------------------
-# Prediction
+# Prediction helper
 # ----------------------------
 def predict_tensor(model, input_tensor, threshold=0.5, temperature=1.0, bias_factor=1.0):
     device = torch.device("cpu")
     model = model.to(device)
     input_tensor = input_tensor.to(device)
+
     model.eval()
     with torch.no_grad():
         outputs = model(input_tensor)
@@ -140,15 +165,16 @@ def predict_tensor(model, input_tensor, threshold=0.5, temperature=1.0, bias_fac
         logits = out.numpy() / float(temperature)
         exp = np.exp(logits - np.max(logits))
         probs = exp / exp.sum()
-        probs[1] *= bias_factor
+        probs[1] = float(probs[1]) * float(bias_factor)
         probs = probs / probs.sum()
         pred = 1 if probs[1] >= threshold else 0
-    return pred, probs
+    return pred, probs, logits
 
 # ----------------------------
-# UI
+# UI: Upload + Predict
 # ----------------------------
 uploaded_file = st.file_uploader("📤 Upload an image", type=["jpg", "jpeg", "png"])
+
 if uploaded_file is not None:
     image = Image.open(uploaded_file).convert("RGB")
     st.image(image, caption="Uploaded Image", use_container_width=True)
@@ -158,12 +184,23 @@ if uploaded_file is not None:
         if model is None:
             st.warning("⚠️ Model not loaded.")
         else:
-            pred, probs = predict_tensor(model, input_tensor, threshold, temperature, bias_factor)
+            pred, probs, raw_logits = predict_tensor(model, input_tensor, threshold, temperature, bias_factor)
             labels = ["Non Ovarian Cancer", "Ovarian Cancer"]
             if flip_labels:
                 labels = labels[::-1]
-            st.subheader(f"🎯 Prediction: {labels[pred]}")
+            pred_label = labels[pred]
+
+            st.subheader(f"🎯 Prediction: {pred_label}")
             st.write(f"Probabilities — {labels[0]}: {probs[0]*100:.2f}%, {labels[1]}: {probs[1]*100:.2f}%")
             st.progress(int(probs[1]*100))
             if show_debug:
-                st.write("Raw probabilities:", probs)
+                st.write("Raw logits:", raw_logits)
+                st.write("Post-bias probabilities:", probs)
+
+            diff = abs(probs[1] - probs[0])
+            if probs[1] > 0.90:
+                st.info("🧠 Model is highly confident — strong Ovarian Cancer signal.")
+            elif probs[0] > 0.90:
+                st.info("🩺 Model is highly confident — strong Non-Ovarian Cancer signal.")
+            elif diff < 0.12:
+                st.warning("⚠️ Model uncertain — probabilities are close. Try adjusting parameters.")
