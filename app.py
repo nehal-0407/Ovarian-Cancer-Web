@@ -16,32 +16,31 @@ import sys, types, builtins
 # ------------------------------------------------
 if "pytorch_grad_cam" not in sys.modules:
     pkg = types.ModuleType("pytorch_grad_cam")
+    pkg.__path__ = []
     sys.modules["pytorch_grad_cam"] = pkg
-    pkg.__path__ = []  # Make it behave like a package
 
-# Fake submodules
-for sub in [
-    "activations_and_gradients",
-    "base_cam",
-    "grad_cam",
-    "grad_cam_plusplus",
-    "ablation_cam",
-    "xgrad_cam",
-    "layer_cam",
-    "eigencam",
-    "eigengrad_cam",
-    "score_cam",
-    "utils",
-]:
+# create dummy submodules
+submodules = [
+    "activations_and_gradients", "base_cam", "grad_cam", "grad_cam_plusplus",
+    "ablation_cam", "xgrad_cam", "layer_cam", "eigencam",
+    "eigengrad_cam", "score_cam", "utils"
+]
+for sub in submodules:
     sys.modules[f"pytorch_grad_cam.{sub}"] = types.ModuleType(f"pytorch_grad_cam.{sub}")
 
-# ✅ Define dummy class so pickle doesn't fail
+# ✅ Robust dummy class with all missing methods
 class ActivationsAndGradients:
     def __init__(self, *args, **kwargs):
-        pass
+        self.activations = []
+        self.gradients = []
+    def save_activation(self, *a, **kw): pass
+    def save_gradient(self, *a, **kw): pass
+    def release(self): pass
+    def __call__(self, x): return x
+    def __getstate__(self): return {}
+    def __setstate__(self, state): pass
 
 sys.modules["pytorch_grad_cam.activations_and_gradients"].ActivationsAndGradients = ActivationsAndGradients
-
 
 # ------------------------------------------------
 # 🌐 Streamlit setup
@@ -50,16 +49,12 @@ st.set_page_config(page_title="Ovarian Cancer Prediction", page_icon="🧬", lay
 st.title("🧬 Ovarian Cancer Detection App")
 st.write("Upload a histopathology image to predict whether it's **Ovarian Cancer or Non-Ovarian Cancer**.")
 
-
 # ------------------------------------------------
-# ⚙️ Sidebar settings
+# ⚙️ Sidebar
 # ------------------------------------------------
 st.sidebar.header("⚙️ Preprocessing & Calibration")
-
 input_size = st.sidebar.selectbox("Input size (pixels)", [224, 256, 288, 384], index=0)
-normalization = st.sidebar.selectbox(
-    "Normalization", ["ImageNet (default)", "0-1 (no normalize)", "Custom"], index=0
-)
+normalization = st.sidebar.selectbox("Normalization", ["ImageNet (default)", "0-1 (no normalize)", "Custom"], index=0)
 
 if normalization == "Custom":
     mean_str = st.sidebar.text_input("Mean (comma)", "0.485,0.456,0.406")
@@ -69,24 +64,20 @@ if normalization == "Custom":
         std = [float(x.strip()) for x in std_str.split(",")]
     except:
         st.sidebar.error("⚠️ Error parsing custom mean/std — using defaults.")
-        mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        mean, std = [0.485,0.456,0.406], [0.229,0.224,0.225]
 elif normalization == "ImageNet (default)":
-    mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+    mean, std = [0.485,0.456,0.406], [0.229,0.224,0.225]
 else:
-    mean, std = [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]
+    mean, std = [0.0,0.0,0.0], [1.0,1.0,1.0]
 
-threshold = st.sidebar.slider("Decision threshold for Cancer", 0.0, 1.0, 0.5, 0.01)
-temperature = st.sidebar.slider("Temperature (confidence calibration)", 0.5, 3.0, 1.5, 0.1)
-bias_factor = st.sidebar.slider("Bias factor (malignant multiplier)", 0.2, 2.0, 1.0, 0.01)
-flip_labels = st.sidebar.checkbox("Reverse label interpretation", False)
-show_debug = st.sidebar.checkbox("Show raw logits/probabilities", False)
-
-st.sidebar.markdown("---")
-st.sidebar.caption("If your model over-predicts cancer, try reducing Bias factor (<1).")
-
+threshold = st.sidebar.slider("Decision threshold", 0.0, 1.0, 0.5, 0.01)
+temperature = st.sidebar.slider("Temperature", 0.5, 3.0, 1.5, 0.1)
+bias_factor = st.sidebar.slider("Bias factor", 0.2, 2.0, 1.0, 0.01)
+flip_labels = st.sidebar.checkbox("Reverse labels", False)
+show_debug = st.sidebar.checkbox("Show raw logits", False)
 
 # ------------------------------------------------
-# 🧠 Model definition
+# 🧠 Model class
 # ------------------------------------------------
 class HybridCNNViT(nn.Module):
     def __init__(self, cnn_model_name="resnet50", vit_model_name="vit_base_patch16_224", num_classes=2):
@@ -95,122 +86,77 @@ class HybridCNNViT(nn.Module):
         self.vit = timm.create_model(vit_model_name, pretrained=False, num_classes=0, global_pool="avg")
         combined_features = self.cnn.num_features + self.vit.num_features
         self.classifier = nn.Linear(combined_features, num_classes)
-
     def forward(self, x):
-        cnn_features = self.cnn(x)
-        vit_features = self.vit(x)
-        combined = torch.cat((cnn_features, vit_features), dim=1)
-        return self.classifier(combined)
+        return self.classifier(torch.cat((self.cnn(x), self.vit(x)), dim=1))
 
-# Ensure pickle can locate the class
-builtins.HybridCNNViT = HybridCNNViT
-
+builtins.HybridCNNViT = HybridCNNViT  # so pickle can find it
 
 # ------------------------------------------------
-# 📥 Model download + load
+# 📥 Model load
 # ------------------------------------------------
 @st.cache_resource
 def ensure_model_downloaded(local_path="hybrid_models_fixed.pkl"):
     FILE_ID = "1fxzDo4lgzMORaQgwjcZe42Xq1F62IBQK"
-    DRIVE_URL = f"https://drive.google.com/uc?id={FILE_ID}"
+    URL = f"https://drive.google.com/uc?id={FILE_ID}"
     if not os.path.exists(local_path):
-        st.info("📥 Downloading model from Google Drive...")
-        try:
-            gdown.download(DRIVE_URL, local_path, quiet=False)
-            st.success("✅ Model downloaded successfully.")
-        except Exception as e:
-            st.error(f"❌ Failed to download model: {e}")
+        st.info("📥 Downloading model...")
+        gdown.download(URL, local_path, quiet=False)
+        st.success("✅ Model downloaded")
     return local_path
-
 
 @st.cache_resource
 def load_model():
-    model_path = ensure_model_downloaded()
+    path = ensure_model_downloaded()
     try:
-        with open(model_path, "rb") as f:
+        with open(path, "rb") as f:
             model = pickle.load(f)
-        if not hasattr(model, "classifier"):
-            cnn_f = getattr(model.cnn, "num_features", 2048)
-            vit_f = getattr(model.vit, "num_features", 768)
-            model.classifier = nn.Linear(cnn_f + vit_f, 2)
-            st.info("🔧 Classifier layer added automatically.")
         model.eval()
         return model
     except Exception as e:
         st.error(f"❌ Failed to load model: {e}")
         return None
 
-
 model = load_model()
 
-
 # ------------------------------------------------
-# 🧩 Preprocessing
+# 🧩 Preprocessing + Predict
 # ------------------------------------------------
 def make_transform(size, mean, std):
     return transforms.Compose([
         transforms.Resize((size, size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std)
+        transforms.Normalize(mean, std)
     ])
-
 transform = make_transform(input_size, mean, std)
 
-
-# ------------------------------------------------
-# 🔮 Prediction
-# ------------------------------------------------
 def predict_tensor(model, input_tensor, threshold=0.5, temperature=1.0, bias_factor=1.0):
-    device = torch.device("cpu")
-    model = model.to(device)
-    input_tensor = input_tensor.to(device)
     model.eval()
     with torch.no_grad():
-        outputs = model(input_tensor)
-        out = outputs.detach().cpu().squeeze(0)
-        logits = out.numpy() / float(temperature)
-        if logits.shape[0] == 1:
-            logit = float(np.asarray(logits).item())
-            prob_cancer = float(torch.sigmoid(torch.tensor(logit)).item())
-            probs = np.array([1.0 - prob_cancer, prob_cancer])
-        else:
-            exp = np.exp(logits - np.max(logits))
-            probs = exp / exp.sum()
-        probs[1] = probs[1] * bias_factor
-        probs = probs / probs.sum()
+        out = model(input_tensor).squeeze(0).cpu().numpy() / temperature
+        exp = np.exp(out - np.max(out))
+        probs = exp / exp.sum()
+        probs[1] *= bias_factor
+        probs /= probs.sum()
         pred = 1 if probs[1] >= threshold else 0
-    return pred, probs, logits
-
+        return pred, probs, out
 
 # ------------------------------------------------
 # 🖼️ UI
 # ------------------------------------------------
-uploaded_file = st.file_uploader("📤 Upload an image", type=["jpg", "jpeg", "png"])
-
-if uploaded_file is not None:
-    image = Image.open(uploaded_file).convert("RGB")
-    st.image(image, caption="Uploaded Image", use_container_width=True)
-    input_tensor = transform(image).unsqueeze(0)
-
+uploaded = st.file_uploader("📤 Upload image", type=["jpg","jpeg","png"])
+if uploaded:
+    img = Image.open(uploaded).convert("RGB")
+    st.image(img, caption="Uploaded Image", use_container_width=True)
+    tensor = transform(img).unsqueeze(0)
     if st.button("🔍 Predict"):
         if model is None:
             st.warning("⚠️ Model not loaded.")
         else:
-            pred, probs, raw_logits = predict_tensor(model, input_tensor, threshold, temperature, bias_factor)
+            pred, probs, raw = predict_tensor(model, tensor, threshold, temperature, bias_factor)
             labels = ["Non Ovarian Cancer", "Ovarian Cancer"]
-            if flip_labels:
-                labels = labels[::-1]
-            pred_label = labels[pred]
-            st.subheader(f"🎯 Prediction: {pred_label}")
-            st.write(f"Probabilities — {labels[0]}: {probs[0]*100:.2f}%, {labels[1]}: {probs[1]*100:.2f}%")
+            if flip_labels: labels.reverse()
+            st.subheader(f"🎯 Prediction: {labels[pred]}")
+            st.write(f"{labels[0]}: {probs[0]*100:.2f}% | {labels[1]}: {probs[1]*100:.2f}%")
             st.progress(int(probs[1]*100))
             if show_debug:
-                st.write("Raw logits:", raw_logits)
-                st.write("Post-bias probabilities:", probs)
-            diff = abs(probs[1] - probs[0])
-            if probs[1] > 0.90:
-                st.info("🧠 Model is highly confident — strong Ovarian Cancer signal.")
-            elif probs[0] > 0.90:
-                st.info("🩺 Model is highly confident — strong Non-Ovarian Cancer signal.")
-            elif diff < 0.12:
-                st.warning("⚠️ Model uncertain — probabilities are close. Try adjusting parameters.")
+                st.write("Raw logits:", raw)
