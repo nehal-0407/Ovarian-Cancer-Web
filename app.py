@@ -9,12 +9,29 @@ import pickle
 import numpy as np
 import os
 import gdown
+import sys, types
 
 
 # --- Patch for missing pytorch_grad_cam on Streamlit Cloud ---
-import sys, types
 if "pytorch_grad_cam" not in sys.modules:
-    sys.modules["pytorch_grad_cam"] = types.ModuleType("pytorch_grad_cam")
+    fake_cam = types.ModuleType("pytorch_grad_cam")
+    sys.modules["pytorch_grad_cam"] = fake_cam
+    # Fake required submodules so unpickling works
+    for sub in [
+        "activations_and_gradients",
+        "base_cam",
+        "grad_cam",
+        "grad_cam_plusplus",
+        "ablation_cam",
+        "xgrad_cam",
+        "layer_cam",
+        "eigencam",
+        "eigengrad_cam",
+        "score_cam",
+    ]:
+        submodule = types.ModuleType(f"pytorch_grad_cam.{sub}")
+        setattr(fake_cam, sub, submodule)
+        sys.modules[f"pytorch_grad_cam.{sub}"] = submodule
 
 
 # ----------------------------
@@ -24,8 +41,9 @@ st.set_page_config(page_title="Ovarian Cancer Prediction", page_icon="🧬", lay
 st.title("🧬 Ovarian Cancer Detection App")
 st.write("Upload a histopathology image to predict whether it's **Ovarian Cancer or Non-Ovarian Cancer**.")
 
+
 # ----------------------------
-# Sidebar controls
+# Sidebar configuration
 # ----------------------------
 st.sidebar.header("⚙️ Preprocessing & Calibration")
 input_size = st.sidebar.selectbox("Input size (pixels)", [224, 256, 288, 384], index=0)
@@ -53,20 +71,17 @@ else:
 
 threshold = st.sidebar.slider("Decision threshold for Cancer", 0.0, 1.0, 0.50, 0.01)
 temperature = st.sidebar.slider("Temperature (confidence calibration)", 0.5, 3.0, 1.5, 0.1)
-
-if "bias_factor" not in st.session_state:
-    st.session_state.bias_factor = 1.0
-bias_factor = st.sidebar.slider("Bias factor (malignant multiplier)", 0.2, 2.0, float(st.session_state.bias_factor), 0.01)
+bias_factor = st.sidebar.slider("Bias factor (Ovarian Cancer multiplier)", 0.5, 2.0, 1.0, 0.01)
 
 flip_labels = st.sidebar.checkbox("Reverse label interpretation", False)
 show_debug = st.sidebar.checkbox("Show raw logits/probabilities", False)
 
 st.sidebar.markdown("---")
 st.sidebar.caption("If your model over-predicts cancer, try reducing Bias factor (<1).")
-st.sidebar.caption("Use 'Auto-calibrate from ./test_images' if you have labeled examples locally.")
+
 
 # ----------------------------
-# Model definition
+# Hybrid model definition
 # ----------------------------
 class HybridCNNViT(nn.Module):
     def __init__(self, cnn_model_name="resnet50", vit_model_name="vit_base_patch16_224", num_classes=2):
@@ -82,8 +97,9 @@ class HybridCNNViT(nn.Module):
         combined = torch.cat((cnn_features, vit_features), dim=1)
         return self.classifier(combined)
 
+
 # ----------------------------
-# Download model from Google Drive if not exists
+# Download model from Google Drive
 # ----------------------------
 @st.cache_resource
 def ensure_model_downloaded(local_path="hybrid_models_fixed.pkl"):
@@ -99,8 +115,9 @@ def ensure_model_downloaded(local_path="hybrid_models_fixed.pkl"):
             st.error(f"❌ Failed to download model: {e}")
     return local_path
 
+
 # ----------------------------
-# Load model
+# Load model safely
 # ----------------------------
 @st.cache_resource
 def load_model():
@@ -108,23 +125,27 @@ def load_model():
     try:
         with open(model_path, "rb") as f:
             model = pickle.load(f)
+
+        # Add classifier if missing
         if not hasattr(model, "classifier"):
             cnn_f = getattr(model.cnn, "num_features", 2048)
             vit_f = getattr(model.vit, "num_features", 768)
             model.classifier = nn.Linear(cnn_f + vit_f, 2)
-            with open(model_path, "wb") as fx:
-                pickle.dump(model, fx)
-            st.info("🔧 Classifier added and saved.")
+            st.info("🔧 Classifier added (auto-fixed).")
+
         model.eval()
         return model
+
     except Exception as e:
         st.error(f"❌ Failed to load model: {e}")
         return None
 
+
 model = load_model()
 
+
 # ----------------------------
-# Image preprocessing
+# Preprocessing
 # ----------------------------
 def make_transform(size, mean, std):
     return transforms.Compose([
@@ -133,7 +154,9 @@ def make_transform(size, mean, std):
         transforms.Normalize(mean=mean, std=std)
     ])
 
+
 transform = make_transform(input_size, mean, std)
+
 
 # ----------------------------
 # Prediction helper
@@ -150,17 +173,16 @@ def predict_tensor(model, input_tensor, threshold=0.5, temperature=1.0, bias_fac
         if out.ndim == 0:
             out = out.unsqueeze(0)
         logits = out.numpy() / float(temperature)
-        if logits.shape[0] == 1:
-            logit = float(np.asarray(logits).item())
-            prob_cancer = float(torch.sigmoid(torch.tensor(logit)).item())
-            probs = np.array([1.0 - prob_cancer, prob_cancer])
-        else:
-            exp = np.exp(logits - np.max(logits))
-            probs = exp / exp.sum()
+
+        exp = np.exp(logits - np.max(logits))
+        probs = exp / exp.sum()
+
         probs[1] = float(probs[1]) * float(bias_factor)
         probs = probs / probs.sum()
+
         pred = 1 if probs[1] >= threshold else 0
     return pred, probs, logits
+
 
 # ----------------------------
 # UI: Upload + Predict
@@ -188,6 +210,7 @@ if uploaded_file is not None:
             if show_debug:
                 st.write("Raw logits:", raw_logits)
                 st.write("Post-bias probabilities:", probs)
+
             diff = abs(probs[1] - probs[0])
             if probs[1] > 0.90:
                 st.info("🧠 Model is highly confident — strong Ovarian Cancer signal.")
@@ -195,4 +218,3 @@ if uploaded_file is not None:
                 st.info("🩺 Model is highly confident — strong Non-Ovarian Cancer signal.")
             elif diff < 0.12:
                 st.warning("⚠️ Model uncertain — probabilities are close. Try adjusting parameters.")
-
