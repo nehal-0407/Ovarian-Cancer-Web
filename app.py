@@ -92,31 +92,38 @@ class HybridCNNViT(nn.Module):
 builtins.HybridCNNViT = HybridCNNViT  # so pickle can find it
 
 # ------------------------------------------------
-# 📥 Model load
+# 📥 Model load (patched for timm Attention.norm)
 # ------------------------------------------------
-@st.cache_resource
-def ensure_model_downloaded(local_path="hybrid_models_fixed.pkl"):
-    FILE_ID = "1fxzDo4lgzMORaQgwjcZe42Xq1F62IBQK"
-    URL = f"https://drive.google.com/uc?id={FILE_ID}"
-    if not os.path.exists(local_path):
-        st.info("📥 Downloading model...")
-        gdown.download(URL, local_path, quiet=False)
-        st.success("✅ Model downloaded")
-    return local_path
-
 @st.cache_resource
 def load_model():
     path = ensure_model_downloaded()
+
+    # --- Patch timm Attention if needed ---
+    import timm.models.vision_transformer as vit_mod
+
+    if hasattr(vit_mod, "Attention"):
+        Attn = vit_mod.Attention
+        # Add dummy .norm if it doesn't exist
+        if not hasattr(Attn, "norm"):
+            def fake_norm(self, x):
+                return x
+            Attn.norm = fake_norm
+            # also handle missing norm attributes on instances
+            old_init = Attn.__init__
+            def new_init(self, *a, **kw):
+                old_init(self, *a, **kw)
+                self.norm = lambda x: x
+            Attn.__init__ = new_init
+
     try:
         with open(path, "rb") as f:
             model = pickle.load(f)
         model.eval()
+        st.success("✅ Model loaded successfully.")
         return model
     except Exception as e:
         st.error(f"❌ Failed to load model: {e}")
         return None
-
-model = load_model()
 
 # ------------------------------------------------
 # 🧩 Preprocessing + Predict
