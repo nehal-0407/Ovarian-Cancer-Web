@@ -2,7 +2,6 @@ streamlit
 torch
 torchvision
 timm
-numpy
-pillow
 gdown
-grad-cam
+pillow
+numpy
